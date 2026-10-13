@@ -26,7 +26,7 @@ import java.util.Optional;
 @Plugin(
         id = "sendlobby-velocity",
         name = "SendLobby-Velocity",
-        version = "1.0",
+        version = "1.1.0",
         description = "A simple /lobby and /hub command for Velocity.",
         authors = {"YourName"}
 )
@@ -39,6 +39,7 @@ public class SendLobby {
             lobby-server: lobby
 
             # Main command (without the slash) and aliases separated by commas
+            # (changing these requires a proxy restart, /lobbyreload does not apply them)
             command: lobby
             aliases: hub, l
 
@@ -46,17 +47,25 @@ public class SendLobby {
             # Example: lobby.use
             permission:
 
+            # Permission required to use /lobbyreload (the console can always use it)
+            reload-permission: sendlobby.reload
+
+            # Print extra information to the proxy console (true or false)
+            debug: true
+
             # Messages. Use & for colors, for example &a, &c, &e.
             message-moving: &aSending you to the lobby...
             message-already: &cYou are already in the lobby.
             message-no-server: &cThe lobby server does not exist. Please contact an administrator.
             message-players-only: &cThis command can only be used by players.
+            message-reloaded: &aConfiguration reloaded.
+            message-reload-failed: &cCould not reload the configuration. Check the console.
             """;
 
     private final ProxyServer server;
     private final Logger logger;
     private final Path dataDirectory;
-    private final Map<String, String> config = new HashMap<>();
+    private volatile Map<String, String> config = new HashMap<>();
 
     @Inject
     public SendLobby(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
@@ -75,20 +84,31 @@ public class SendLobby {
                 ? new String[0]
                 : aliasesRaw.replace(" ", "").split(",");
 
-        CommandMeta meta = server.getCommandManager()
+        CommandMeta lobbyMeta = server.getCommandManager()
                 .metaBuilder(command)
                 .aliases(aliases)
                 .plugin(this)
                 .build();
-        server.getCommandManager().register(meta, new LobbyCommand());
+        server.getCommandManager().register(lobbyMeta, new LobbyCommand());
+
+        CommandMeta reloadMeta = server.getCommandManager()
+                .metaBuilder("lobbyreload")
+                .plugin(this)
+                .build();
+        server.getCommandManager().register(reloadMeta, new ReloadCommand());
+
+        debug("Registered command /" + command + " with aliases " + String.join(", ", aliases));
     }
 
-    private void loadConfig() {
+    // Returns true if the config was loaded without errors.
+    private boolean loadConfig() {
+        Map<String, String> loaded = new HashMap<>();
         try {
             Files.createDirectories(dataDirectory);
             Path file = dataDirectory.resolve("config.yml");
             if (Files.notExists(file)) {
                 Files.writeString(file, DEFAULT_CONFIG, StandardCharsets.UTF_8);
+                logger.info("Created default config.yml");
             }
             List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
             for (String line : lines) {
@@ -103,15 +123,30 @@ public class SendLobby {
                         || (value.startsWith("'") && value.endsWith("'")))) {
                     value = value.substring(1, value.length() - 1);
                 }
-                config.put(key, value);
+                loaded.put(key, value);
             }
+            config = loaded;
+            debug("Config loaded (" + loaded.size() + " entries). Lobby server: "
+                    + get("lobby-server", "lobby"));
+            return true;
         } catch (IOException ex) {
-            logger.error("Could not load config.yml, using default values.", ex);
+            logger.error("Could not load config.yml, keeping the previous values.", ex);
+            return false;
         }
     }
 
     private String get(String key, String fallback) {
         return config.getOrDefault(key, fallback);
+    }
+
+    private boolean isDebug() {
+        return get("debug", "true").equalsIgnoreCase("true");
+    }
+
+    private void debug(String message) {
+        if (isDebug()) {
+            logger.info("[DEBUG] " + message);
+        }
     }
 
     private Component msg(String key, String fallback) {
@@ -130,6 +165,7 @@ public class SendLobby {
         public void execute(Invocation inv) {
             if (!(inv.source() instanceof Player p)) {
                 inv.source().sendMessage(msg("message-players-only", "&cThis command can only be used by players."));
+                debug("Command used by the console, ignoring.");
                 return;
             }
 
@@ -137,6 +173,7 @@ public class SendLobby {
             Optional<RegisteredServer> lobby = server.getServer(lobbyName);
             if (lobby.isEmpty()) {
                 p.sendMessage(msg("message-no-server", "&cThe lobby server does not exist."));
+                debug("Server '" + lobbyName + "' is not defined in velocity.toml (player: " + p.getUsername() + ").");
                 return;
             }
 
@@ -145,11 +182,32 @@ public class SendLobby {
                     .orElse(false);
             if (alreadyThere) {
                 p.sendMessage(msg("message-already", "&cYou are already in the lobby."));
+                debug(p.getUsername() + " is already on '" + lobbyName + "'.");
                 return;
             }
 
             p.sendMessage(msg("message-moving", "&aSending you to the lobby..."));
+            debug("Sending " + p.getUsername() + " to '" + lobbyName + "'.");
             p.createConnectionRequest(lobby.get()).fireAndForget();
+        }
+    }
+
+    private class ReloadCommand implements SimpleCommand {
+
+        @Override
+        public boolean hasPermission(Invocation inv) {
+            String perm = get("reload-permission", "sendlobby.reload");
+            return perm.isBlank() || inv.source().hasPermission(perm);
+        }
+
+        @Override
+        public void execute(Invocation inv) {
+            boolean ok = loadConfig();
+            if (ok) {
+                inv.source().sendMessage(msg("message-reloaded", "&aConfiguration reloaded."));
+            } else {
+                inv.source().sendMessage(msg("message-reload-failed", "&cCould not reload the configuration."));
+            }
         }
     }
 }
